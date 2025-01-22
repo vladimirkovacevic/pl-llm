@@ -17,9 +17,10 @@ from transformers import AutoModel, AutoTokenizer, DataCollatorWithPadding
 import wandb
 
 WARMUP_STEPS = 5000
-EPOCHS = 5
-SAMPLE_SIZE = 10_000
+EPOCHS = 30
+SAMPLE_SIZE = 200_000
 BATCH_SIZE = 32
+LR = 1e-4
 
 esm_model_name = (
     "facebook/esm2_t33_650M_UR50D"  # Replace with the correct ESM2 model name
@@ -351,7 +352,7 @@ def main(timestamp, args):
         else:
             remaining_steps = total_steps - WARMUP_STEPS
             decay_step = step - WARMUP_STEPS
-            return max(0.0, 1.0 - decay_step / remaining_steps)
+            return max(0.5 * LR, 1.0 - 0.5 * (decay_step / remaining_steps))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device {device}")
@@ -359,7 +360,7 @@ def main(timestamp, args):
         esm_model_name, chem_model_name
     ).to(device)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=0)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     total_steps = EPOCHS * len(train_dataloader)
@@ -400,6 +401,9 @@ def main(timestamp, args):
             train_loss /= len(train_dataloader)
             print(f"Epoch: {epoch} Train loss: {train_loss}")
 
+            if epoch > 15:
+                torch.save(model.state_dict(), f"affinity_{timestamp}_{epoch}.pt")
+
             model.eval()
             val_loss = 0.0
             val_progress = tqdm(val_dataloader, desc="Validation")
@@ -423,7 +427,7 @@ def main(timestamp, args):
             wandb.log({"val_loss": val_loss})
             print(f"Epoch: {epoch} Val loss: {val_loss}")
 
-    train_model(model, train_dataloader, test_dataloader)
+    train_model(model, train_dataloader, val_dataloader)
 
     torch.save(model.state_dict(), f"affinity_{timestamp}.pt")
 
