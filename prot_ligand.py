@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import DatasetDict
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -17,18 +18,21 @@ from transformers import AutoModel, AutoTokenizer, DataCollatorWithPadding
 
 import wandb
 
-WARMUP_STEPS = 5000
-EPOCHS = 30
-SAMPLE_SIZE = 200_000
-BATCH_SIZE = 16
-LR = 3e-4
+WARMUP_STEPS = 1000
+EPOCHS = 8
+SAMPLE_SIZE = 100_000
+BATCH_SIZE = 32
+LR = 2e-4
 
-esm_model_name = (
-    "facebook/esm2_t33_650M_UR50D"  # Replace with the correct ESM2 model name
-)
-chem_model_name = (
-    "seyonec/ChemBERTa-zinc-base-v1"  # Replace with the correct ChemLLM model name
-)
+# esm_model_name = (
+#     "facebook/esm2_t33_650M_UR50D"  # Replace with the correct ESM2 model name
+# )
+# chem_model_name = (
+#     "seyonec/ChemBERTa-zinc-base-v1"  # Replace with the correct ChemLLM model name
+# )
+
+esm_model_name = "/home/share/huadjyin/home/nikolamilicevic/.cache/huggingface/hub/models--facebook--esm2_t33_650M_UR50D/snapshots/08e4846e537177426273712802403f7ba8261b6c/"
+chem_model_name = "/home/share/huadjyin/home/nikolamilicevic/.cache/huggingface/hub/models--seyonec--ChemBERTa-zinc-base-v1/snapshots/761d6a18cf99db371e0b43baf3e2d21b3e865a20/"
 
 
 class CrossAttentionLayer(nn.Module):
@@ -228,7 +232,8 @@ class CustomDataCollator:
             "ligand_attention_mask": collated_chem["attention_mask"],
             "protein_input_ids": collated_esm["input_ids"],
             "protein_attention_mask": collated_esm["attention_mask"],
-            "ic50": torch.tensor([x["ic50_scaled"] for x in batch]),
+            # "ic50": torch.tensor([x["ic50_scaled"] for x in batch]),
+            "ic50": torch.tensor([x["ic50"] for x in batch]),
         }
 
 
@@ -239,7 +244,7 @@ def main(timestamp, args):
         name=args.wandb_name,
         config={
             "batch_size": 8,
-            "dataset": "testing_200k",
+            "dataset": "testing_100k",
         },
     )
 
@@ -247,7 +252,7 @@ def main(timestamp, args):
     esm_tokenizer = AutoTokenizer.from_pretrained(esm_model_name)
 
     if args.ds_path != "binding_ds_300k":
-        df = pd.read_csv("BindingDB_fin.csv")
+        df = pd.read_csv("/home/share/huadjyin/home/nikolamilicevic/BindingDB_fin.csv")
         df = df.sample(n=SAMPLE_SIZE, random_state=42)
         df = df.rename(
             columns={
@@ -328,27 +333,28 @@ def main(timestamp, args):
 
         tokenized_dataset = dataset.map(tokenize_proteins, batched=True)
         tokenized_dataset = tokenized_dataset.map(tokenize_ligands, batched=True)
+        tokenized_dataset.save_to_disk("binding_ds_100k")
     else:
         tokenized_dataset = datasets.load_from_disk(args.ds_path)
 
-    # Z-Score normalization of ic50
-    scaler = StandardScaler()
-    ic50_train = np.array(tokenized_dataset["train"]["ic50"]).reshape(-1, 1)
-    ic50_test = np.array(tokenized_dataset["test"]["ic50"]).reshape(-1, 1)
-    ic50_validation = np.array(tokenized_dataset["validation"]["ic50"]).reshape(-1, 1)
-    ic50_train_scaled = scaler.fit_transform(ic50_train)
-    ic50_test_scaled = scaler.transform(ic50_test)
-    ic50_validation_scaled = scaler.transform(ic50_validation)
+    # # Z-Score normalization of ic50
+    # scaler = StandardScaler()
+    # ic50_train = np.array(tokenized_dataset["train"]["ic50"]).reshape(-1, 1)
+    # ic50_test = np.array(tokenized_dataset["test"]["ic50"]).reshape(-1, 1)
+    # ic50_validation = np.array(tokenized_dataset["validation"]["ic50"]).reshape(-1, 1)
+    # ic50_train_scaled = scaler.fit_transform(ic50_train)
+    # ic50_test_scaled = scaler.transform(ic50_test)
+    # ic50_validation_scaled = scaler.transform(ic50_validation)
 
-    tokenized_dataset["train"] = tokenized_dataset["train"].add_column(
-        "ic50_scaled", ic50_train_scaled.flatten()
-    )
-    tokenized_dataset["test"] = tokenized_dataset["test"].add_column(
-        "ic50_scaled", ic50_test_scaled.flatten()
-    )
-    tokenized_dataset["validation"] = tokenized_dataset["validation"].add_column(
-        "ic50_scaled", ic50_validation_scaled.flatten()
-    )
+    # tokenized_dataset["train"] = tokenized_dataset["train"].add_column(
+    #     "ic50_scaled", ic50_train_scaled.flatten()
+    # )
+    # tokenized_dataset["test"] = tokenized_dataset["test"].add_column(
+    #     "ic50_scaled", ic50_test_scaled.flatten()
+    # )
+    # tokenized_dataset["validation"] = tokenized_dataset["validation"].add_column(
+    #     "ic50_scaled", ic50_validation_scaled.flatten()
+    # )
 
     # Custom data collator
     chem_collator = DataCollatorWithPadding(tokenizer=chem_tokenizer)
@@ -367,7 +373,6 @@ def main(timestamp, args):
     val_dataloader = DataLoader(
         tokenized_dataset["validation"], batch_size=bs, collate_fn=collator
     )
-
 
     # Training loop
     def lr_lambda(step):
@@ -488,7 +493,14 @@ def main(timestamp, args):
         all_targets = torch.cat(all_targets)
 
         loss = torch.nn.MSELoss()
-        print(f"Test set mean squared error: {loss(all_predictions, all_targets)}")
+        print(
+            f"Test set mean squared error (MSE): {loss(all_predictions, all_targets)}"
+        )
+
+        mse = mean_squared_error(all_targets.cpu(), all_predictions.cpu())
+        mae = mean_absolute_error(all_targets.cpu(), all_predictions.cpu())
+        r2 = r2_score(all_targets.cpu(), all_predictions.cpu())
+        print(f"MSE: {mse}, MAE: {mae}, R²: {r2}")
 
     evaluate_model(model, test_loader=test_dataloader)
 
