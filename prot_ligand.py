@@ -18,9 +18,9 @@ from transformers import AutoModel, AutoTokenizer, DataCollatorWithPadding
 
 import wandb
 
-WARMUP_STEPS = 1000
-EPOCHS = 8
-SAMPLE_SIZE = 100_000
+WARMUP_STEPS = 5000
+EPOCHS = 30
+SAMPLE_SIZE = 200_000
 BATCH_SIZE = 32
 LR = 2e-4
 
@@ -251,7 +251,9 @@ def main(timestamp, args):
     chem_tokenizer = AutoTokenizer.from_pretrained(chem_model_name)
     esm_tokenizer = AutoTokenizer.from_pretrained(esm_model_name)
 
-    if args.ds_path != "binding_ds_300k":
+    if (
+        "binding" in args.ds_path
+    ):  # for testing, assuming name such as binding_200k etc.
         df = pd.read_csv("/home/share/huadjyin/home/nikolamilicevic/BindingDB_fin.csv")
         df = df.sample(n=SAMPLE_SIZE, random_state=42)
         df = df.rename(
@@ -509,20 +511,11 @@ def main(timestamp, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Script that trains model on protein-ligand interactions represented via ic50."
+        description="Script that trains model on protein-ligand interactions represented via ic50. Make sure you have wandb on your machine and you are logged in."
     )
-    parser.add_argument(
-        "-p",
-        "--param",
-        help="Some parameter random.",
-        type=str,
-        required=False,
-        default="something",
-    )
-
     parser.add_argument(
         "--wandb_name",
-        help="Name of run on wandb",
+        help="Name of run on wandb platform",
         type=str,
         required=False,
         default="affinity_script",
@@ -532,7 +525,7 @@ if __name__ == "__main__":
         "--ds_path",
         help="Path of the dataset in huggingface datasets format",
         type=str,
-        required=False,
+        required=True,
         default="binding_ds_300k",
     )
 
