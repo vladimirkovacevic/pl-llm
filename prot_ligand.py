@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import DatasetDict
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer, DataCollatorWithPadding
@@ -17,16 +19,20 @@ from transformers import AutoModel, AutoTokenizer, DataCollatorWithPadding
 import wandb
 
 WARMUP_STEPS = 5000
-EPOCHS = 5
-SAMPLE_SIZE = 10_000
+EPOCHS = 30
+SAMPLE_SIZE = 200_000
 BATCH_SIZE = 32
+LR = 2e-4
 
-esm_model_name = (
-    "facebook/esm2_t33_650M_UR50D"  # Replace with the correct ESM2 model name
-)
-chem_model_name = (
-    "seyonec/ChemBERTa-zinc-base-v1"  # Replace with the correct ChemLLM model name
-)
+# esm_model_name = (
+#     "facebook/esm2_t33_650M_UR50D"  # Replace with the correct ESM2 model name
+# )
+# chem_model_name = (
+#     "seyonec/ChemBERTa-zinc-base-v1"  # Replace with the correct ChemLLM model name
+# )
+
+esm_model_name = "/home/share/huadjyin/home/nikolamilicevic/.cache/huggingface/hub/models--facebook--esm2_t33_650M_UR50D/snapshots/08e4846e537177426273712802403f7ba8261b6c/"
+chem_model_name = "/home/share/huadjyin/home/nikolamilicevic/.cache/huggingface/hub/models--seyonec--ChemBERTa-zinc-base-v1/snapshots/761d6a18cf99db371e0b43baf3e2d21b3e865a20/"
 
 
 class CrossAttentionLayer(nn.Module):
@@ -226,6 +232,7 @@ class CustomDataCollator:
             "ligand_attention_mask": collated_chem["attention_mask"],
             "protein_input_ids": collated_esm["input_ids"],
             "protein_attention_mask": collated_esm["attention_mask"],
+            # "ic50": torch.tensor([x["ic50_scaled"] for x in batch]),
             "ic50": torch.tensor([x["ic50"] for x in batch]),
         }
 
@@ -237,93 +244,119 @@ def main(timestamp, args):
         name=args.wandb_name,
         config={
             "batch_size": 8,
-            "dataset": "testing_200k",
+            "dataset": "testing_100k",
         },
     )
 
-    df = pd.read_csv("BindingDB_fin.csv")
-    df = df.sample(n=SAMPLE_SIZE, random_state=42)
-    df = df.rename(
-        columns={
-            "Ligand SMILES": "ligand",
-            "BindingDB Target Chain Sequence": "protein",
-            "IC50 (nM)": "ic50",
-        }
-    )
-    ic50 = df["ic50"][~df["ic50"].isna()]
-    less_than = ic50.str.contains("<")
-    greater_than = ic50.str.contains(">")
-    ic50 = ic50[~(less_than | greater_than)]
-    ic50n = ic50.astype(float)
-    df = df.loc[ic50n.index]
-    #  IC50 values are logarithmic in nature;
-    # a compound with an IC50 of 10 nM is 10x more potent than one with 100 nM
-    df["ic50"] = ic50n
-    df = df[df["ic50"] != 0.0]
-    df.loc[:, "ic50"] = np.log(df["ic50"])
-
-    print(f"Ligands total: {len(df['ligand'].values)}")
-    print(f"Ligands unique {len(set(df['ligand'].values))}")
-    print(f"Proteins total {len(df['protein'].values)}")
-    print(f"Proteins unique {len(set(df['protein'].values))}")
-
-    mean_ic50 = np.mean(df["ic50"])
-    y_pred_dummy = np.full_like(df["ic50"], mean_ic50)
-    loss = nn.MSELoss()
-    dummy_loss = loss(torch.tensor(y_pred_dummy), torch.tensor(df["ic50"].values))
-    print(f"Dummy model MSE predicting mean ic50: {dummy_loss}")
-
-    sns.histplot(df["ic50"], bins=100, color="blue")
-    plt.savefig("histplot.png", dpi=300, bbox_inches="tight")
-
-    dataset = datasets.Dataset.from_pandas(df.reset_index(drop=True))
-
-    print(f"Maximum ligand length {df['ligand'].str.len().max()}")
-    print(f"Minimum ligand length {df['ligand'].str.len().min()}")
-    print(f"Mean ligand length {df['ligand'].str.len().mean():.2f}")
-    print(f"Median ligand length {df['ligand'].str.len().median()}")
-    print(f"Maximum protein length {df['protein'].str.len().max()}")
-    print(f"Minimum protein length {df['protein'].str.len().min()}")
-    print(f"Mean protein length {df['protein'].str.len().mean():.2f}")
-    print(f"Median protein length {df['protein'].str.len().median()}")
-
-    # Data split
-    # Filter protein sequences longer than 1024 and ligands longer than 512
-    dataset = dataset.filter(lambda x: len(x["protein"]) < 1024)
-    dataset = dataset.filter(lambda x: len(x["ligand"]) < 512)
-
-    dataset_train_test = dataset.train_test_split(test_size=0.2)
-    dataset_test_val = dataset_train_test["test"].train_test_split(test_size=0.5)
-    dataset_dict = {
-        "train": dataset_train_test["train"],
-        "test": dataset_test_val["train"],
-        "validation": dataset_test_val["test"],
-    }
-    dataset = DatasetDict(dataset_dict)
-
-    # Tokenization
-    # Tokenization of ligands and protein sequences
     chem_tokenizer = AutoTokenizer.from_pretrained(chem_model_name)
     esm_tokenizer = AutoTokenizer.from_pretrained(esm_model_name)
-    print(f"chem tokenizer is fast: {chem_tokenizer.is_fast}")
-    print(f"esm tokenizer is fast: {esm_tokenizer.is_fast}")
 
-    def tokenize_ligands(examples):
-        toks = chem_tokenizer(examples["ligand"], truncation=True)
-        return {
-            "ligand_input_ids": toks["input_ids"],
-            "ligand_attention_mask": toks["attention_mask"],
+    if (
+        "binding" in args.ds_path
+    ):  # for testing, assuming name such as binding_200k etc.
+        df = pd.read_csv("/home/share/huadjyin/home/nikolamilicevic/BindingDB_fin.csv")
+        df = df.sample(n=SAMPLE_SIZE, random_state=42)
+        df = df.rename(
+            columns={
+                "Ligand SMILES": "ligand",
+                "BindingDB Target Chain Sequence": "protein",
+                "IC50 (nM)": "ic50",
+            }
+        )
+        ic50 = df["ic50"][~df["ic50"].isna()]
+        less_than = ic50.str.contains("<")
+        greater_than = ic50.str.contains(">")
+        ic50 = ic50[~(less_than | greater_than)]
+        ic50n = ic50.astype(float)
+        df = df.loc[ic50n.index]
+        #  IC50 values are logarithmic in nature;
+        # a compound with an IC50 of 10 nM is 10x more potent than one with 100 nM
+        df["ic50"] = ic50n
+        df = df[df["ic50"] != 0.0]
+        df.loc[:, "ic50"] = np.log(df["ic50"])
+
+        print(f"Ligands total: {len(df['ligand'].values)}")
+        print(f"Ligands unique {len(set(df['ligand'].values))}")
+        print(f"Proteins total {len(df['protein'].values)}")
+        print(f"Proteins unique {len(set(df['protein'].values))}")
+
+        mean_ic50 = np.mean(df["ic50"])
+        y_pred_dummy = np.full_like(df["ic50"], mean_ic50)
+        loss = nn.MSELoss()
+        dummy_loss = loss(torch.tensor(y_pred_dummy), torch.tensor(df["ic50"].values))
+        print(f"Dummy model MSE predicting mean ic50: {dummy_loss}")
+
+        sns.histplot(df["ic50"], bins=100, color="blue")
+        plt.savefig("histplot.png", dpi=300, bbox_inches="tight")
+
+        dataset = datasets.Dataset.from_pandas(df.reset_index(drop=True))
+
+        print(f"Maximum ligand length {df['ligand'].str.len().max()}")
+        print(f"Minimum ligand length {df['ligand'].str.len().min()}")
+        print(f"Mean ligand length {df['ligand'].str.len().mean():.2f}")
+        print(f"Median ligand length {df['ligand'].str.len().median()}")
+        print(f"Maximum protein length {df['protein'].str.len().max()}")
+        print(f"Minimum protein length {df['protein'].str.len().min()}")
+        print(f"Mean protein length {df['protein'].str.len().mean():.2f}")
+        print(f"Median protein length {df['protein'].str.len().median()}")
+
+        # Data split
+        # Filter protein sequences longer than 1024 and ligands longer than 512
+        dataset = dataset.filter(lambda x: len(x["protein"]) < 1024)
+        dataset = dataset.filter(lambda x: len(x["ligand"]) < 512)
+
+        dataset_train_test = dataset.train_test_split(test_size=0.2)
+        dataset_test_val = dataset_train_test["test"].train_test_split(test_size=0.5)
+        dataset_dict = {
+            "train": dataset_train_test["train"],
+            "test": dataset_test_val["train"],
+            "validation": dataset_test_val["test"],
         }
+        dataset = DatasetDict(dataset_dict)
 
-    def tokenize_proteins(examples):
-        toks = esm_tokenizer(examples["protein"], truncation=True)
-        return {
-            "protein_input_ids": toks["input_ids"],
-            "protein_attention_mask": toks["attention_mask"],
-        }
+        # Tokenization
+        # Tokenization of ligands and protein sequences
+        print(f"chem tokenizer is fast: {chem_tokenizer.is_fast}")
+        print(f"esm tokenizer is fast: {esm_tokenizer.is_fast}")
 
-    tokenized_dataset = dataset.map(tokenize_proteins, batched=True)
-    tokenized_dataset = tokenized_dataset.map(tokenize_ligands, batched=True)
+        def tokenize_ligands(examples):
+            toks = chem_tokenizer(examples["ligand"], truncation=True)
+            return {
+                "ligand_input_ids": toks["input_ids"],
+                "ligand_attention_mask": toks["attention_mask"],
+            }
+
+        def tokenize_proteins(examples):
+            toks = esm_tokenizer(examples["protein"], truncation=True)
+            return {
+                "protein_input_ids": toks["input_ids"],
+                "protein_attention_mask": toks["attention_mask"],
+            }
+
+        tokenized_dataset = dataset.map(tokenize_proteins, batched=True)
+        tokenized_dataset = tokenized_dataset.map(tokenize_ligands, batched=True)
+        tokenized_dataset.save_to_disk("binding_ds_100k")
+    else:
+        tokenized_dataset = datasets.load_from_disk(args.ds_path)
+
+    # # Z-Score normalization of ic50
+    # scaler = StandardScaler()
+    # ic50_train = np.array(tokenized_dataset["train"]["ic50"]).reshape(-1, 1)
+    # ic50_test = np.array(tokenized_dataset["test"]["ic50"]).reshape(-1, 1)
+    # ic50_validation = np.array(tokenized_dataset["validation"]["ic50"]).reshape(-1, 1)
+    # ic50_train_scaled = scaler.fit_transform(ic50_train)
+    # ic50_test_scaled = scaler.transform(ic50_test)
+    # ic50_validation_scaled = scaler.transform(ic50_validation)
+
+    # tokenized_dataset["train"] = tokenized_dataset["train"].add_column(
+    #     "ic50_scaled", ic50_train_scaled.flatten()
+    # )
+    # tokenized_dataset["test"] = tokenized_dataset["test"].add_column(
+    #     "ic50_scaled", ic50_test_scaled.flatten()
+    # )
+    # tokenized_dataset["validation"] = tokenized_dataset["validation"].add_column(
+    #     "ic50_scaled", ic50_validation_scaled.flatten()
+    # )
 
     # Custom data collator
     chem_collator = DataCollatorWithPadding(tokenizer=chem_tokenizer)
@@ -351,7 +384,7 @@ def main(timestamp, args):
         else:
             remaining_steps = total_steps - WARMUP_STEPS
             decay_step = step - WARMUP_STEPS
-            return max(0.0, 1.0 - decay_step / remaining_steps)
+            return max(0.5 * LR, 1.0 - 0.5 * (decay_step / remaining_steps))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device {device}")
@@ -359,7 +392,7 @@ def main(timestamp, args):
         esm_model_name, chem_model_name
     ).to(device)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=0)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     total_steps = EPOCHS * len(train_dataloader)
@@ -400,6 +433,16 @@ def main(timestamp, args):
             train_loss /= len(train_dataloader)
             print(f"Epoch: {epoch} Train loss: {train_loss}")
 
+            if epoch > 20:
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                    },
+                    f"affinity_{timestamp}_{epoch}.pt",
+                )
+
             model.eval()
             val_loss = 0.0
             val_progress = tqdm(val_dataloader, desc="Validation")
@@ -423,7 +466,7 @@ def main(timestamp, args):
             wandb.log({"val_loss": val_loss})
             print(f"Epoch: {epoch} Val loss: {val_loss}")
 
-    train_model(model, train_dataloader, test_dataloader)
+    train_model(model, train_dataloader, val_dataloader)
 
     torch.save(model.state_dict(), f"affinity_{timestamp}.pt")
 
@@ -452,7 +495,14 @@ def main(timestamp, args):
         all_targets = torch.cat(all_targets)
 
         loss = torch.nn.MSELoss()
-        print(f"Test set mean squared error: {loss(all_predictions, all_targets)}")
+        print(
+            f"Test set mean squared error (MSE): {loss(all_predictions, all_targets)}"
+        )
+
+        mse = mean_squared_error(all_targets.cpu(), all_predictions.cpu())
+        mae = mean_absolute_error(all_targets.cpu(), all_predictions.cpu())
+        r2 = r2_score(all_targets.cpu(), all_predictions.cpu())
+        print(f"MSE: {mse}, MAE: {mae}, R²: {r2}")
 
     evaluate_model(model, test_loader=test_dataloader)
 
@@ -461,23 +511,22 @@ def main(timestamp, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Script that trains model on protein-ligand interactions represented via ic50."
+        description="Script that trains model on protein-ligand interactions represented via ic50. Make sure you have wandb on your machine and you are logged in."
     )
-    parser.add_argument(
-        "-p",
-        "--param",
-        help="Some parameter random.",
-        type=str,
-        required=False,
-        default="something",
-    )
-
     parser.add_argument(
         "--wandb_name",
-        help="Name of run on wandb",
+        help="Name of run on wandb platform",
         type=str,
         required=False,
         default="affinity_script",
+    )
+
+    parser.add_argument(
+        "--ds_path",
+        help="Path of the dataset in huggingface datasets format",
+        type=str,
+        required=True,
+        default="binding_ds_300k",
     )
 
     args = parser.parse_args()
